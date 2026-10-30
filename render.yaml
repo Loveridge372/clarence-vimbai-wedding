@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: clarence-vimbai-wedding-staging
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: DATA_DIR
+        value: /var/data/wedding
+    disk:
+      name: wedding-photos
+      mountPath: /var/data
+      sizeGB: 10
