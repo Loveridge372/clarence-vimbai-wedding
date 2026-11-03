@@ -17,7 +17,7 @@ const attempts=new Map();
 http.createServer(async(req,res)=>{try{
 const url=new URL(req.url,'http://localhost');
 if(url.pathname==='/healthz'){res.writeHead(200,{'Content-Type':'text/plain'});return res.end('ok');}
-if(url.pathname==='/api/admin'||url.pathname==='/api/gifts'){
+if(url.pathname==='/api/admin'||url.pathname==='/api/gifts'||url.pathname==='/api/guestbook'){
 const key=req.socket.remoteAddress,now=Date.now(),entry=attempts.get(key)||{count:0,until:now+60000};if(entry.until<now){entry.count=0;entry.until=now+60000;}entry.count++;attempts.set(key,entry);if(entry.count>30){res.writeHead(429,{'Content-Type':'application/json'});return res.end(JSON.stringify({error:'Please wait a minute before trying again.'}));}
 }
 let size=0,chunks=[];for await(const chunk of req){size+=chunk.length;if(size>105*1024*1024){res.writeHead(413);return res.end('Upload is too large');}chunks.push(chunk);}
