@@ -25,7 +25,7 @@ const key=req.socket.remoteAddress,now=Date.now(),entry=attempts.get(key)||{coun
 }
 let size=0,chunks=[];for await(const chunk of req){size+=chunk.length;if(size>105*1024*1024){res.writeHead(413);return res.end('Upload is too large');}chunks.push(chunk);}
 const request=new Request('http://localhost'+req.url,{method:req.method,headers:req.headers,body:chunks.length?Buffer.concat(chunks):undefined});
-const response=await app.fetch(request,{BUCKET:bucket,ADMIN_PASSWORD:process.env.ADMIN_PASSWORD,WHATSAPP_NOTIFY:r=>notifyDecision(r),WHATSAPP_STATUS:messagingStatus(),WITH_RSVP_LOCK:withDecisionLock});
+const response=await app.fetch(request,{BUCKET:bucket,ADMIN_PASSWORD:process.env.ADMIN_PASSWORD,EMAIL_NOTIFY:r=>notifyDecision(r),EMAIL_STATUS:messagingStatus(),WITH_RSVP_LOCK:withDecisionLock});
 res.writeHead(response.status,{...Object.fromEntries(response.headers),'X-Content-Type-Options':'nosniff','Referrer-Policy':'same-origin','X-Frame-Options':'DENY'});
 if(response.body)Readable.fromWeb(response.body).pipe(res);else res.end();
 }catch(e){console.error('Request failed:',e.message);if(!res.headersSent)res.writeHead(500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'Unable to complete the request. Please try again.'}));}
