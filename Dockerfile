@@ -1,6 +1,8 @@
 FROM node:24-alpine
 WORKDIR /app
-COPY package.json server.mjs app.mjs notifications.mjs ./
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY server.mjs app.mjs notifications.mjs ./
 ENV NODE_ENV=production PORT=10000 DATA_DIR=/var/data/wedding
 EXPOSE 10000
 CMD ["node", "server.mjs"]
