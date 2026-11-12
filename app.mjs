@@ -5,16 +5,58 @@ const defaults={names:'Vimbai & Clarence',date:'2026-12-12',venue:'65 Rubidge Cl
 function compareGuestNames(a,b){
   return (a.guestNames||a.name||'').trim().localeCompare((b.guestNames||b.name||'').trim(),'en',{sensitivity:'base'});
 }
+const programmeHours={start:'10:00',end:'20:00'};
+function readLegacyProgramme(programme){
+  return String(programme||'').split('\n').map(line=>line.trim()).filter(Boolean).map(line=>{
+    const match=line.match(/^([01]?\d|2[0-3]):([0-5]\d)\s*(?:[·–—-]\s*)?(.+)$/);
+    return match?{time:match[1].padStart(2,'0')+':'+match[2],title:match[3].trim()}:{time:'',title:line};
+  });
+}
 const json=(x,status=200)=>Response.json(x,{status,headers:{'Cache-Control':'no-store'}});
 export default {async fetch(req,env){try{const u=new URL(req.url),p=u.pathname;const admin=req.headers.get('Authorization')==='Bearer '+env.ADMIN_PASSWORD&&!!env.ADMIN_PASSWORD;const bucket=env.BUCKET;async function get(k){let o=await bucket.get(k);if(!o)return null;const value=await o.json();return k.startsWith('rsvp/')&&value.deletedAt?null:value}async function put(k,v){await bucket.put(k,JSON.stringify(v))}async function list(prefix){let out=[],cursor;do{let r=await bucket.list({prefix,cursor});out.push(...r.objects);cursor=r.truncated?r.cursor:undefined}while(cursor);return out}
 if(p==='/assets/page-background.jpg')return new Response(Uint8Array.from(atob(PAGE_BACKGROUND),c=>c.charCodeAt(0)),{headers:{'Content-Type':'image/jpeg','Cache-Control':'public, max-age=86400'}});if(p.startsWith('/api/')){if(!bucket)return json({error:'Storage is not connected'},503);
-if(p==='/api/settings'){if(req.method==='POST'){if(!admin)return json({error:'Please sign in'},401);let d=await req.json();await put('settings',d);return json({ok:true})}const stored=await get('settings');const s={...defaults,...stored};if(!s.address)s.address=defaults.address;if(!s.venue||s.venue==='Venue to be announced')s.venue=defaults.venue;if(!s.time)s.time=defaults.time;if(s.programme)s.programme=s.programme.replace('13:00 · Guest arrival & welcome drinks','13:30 · Guest arrival & welcome drinks');if(s.names==='Clarence & Vimbai')s.names='Vimbai & Clarence';if(s.programme)s.programme=s.programme.replace(/Reception & dinner/gi,'Reception');const g=u.searchParams.get('token');const allowed=admin||(g&&(await get('rsvp/'+g))?.status==='approved');return json(allowed?s:{names:s.names,date:s.date,time:s.time})}
+if(p==='/api/settings'){
+  if(req.method==='POST'){
+    if(!admin)return json({error:'Please sign in'},401);
+    const changes=await req.json();
+    const stored=await get('settings');
+    await put('settings',{...stored,...changes});
+    return json({ok:true});
+  }
+  const s={...defaults,...await get('settings')};
+  if(!s.address)s.address=defaults.address;
+  if(!s.venue||s.venue==='Venue to be announced')s.venue=defaults.venue;
+  if(!s.time)s.time=defaults.time;
+  if(s.names==='Clarence & Vimbai')s.names='Vimbai & Clarence';
+  const guestToken=u.searchParams.get('token');
+  const allowed=admin||(guestToken&&(await get('rsvp/'+guestToken))?.status==='approved');
+  if(!allowed)return json({names:s.names,date:s.date,time:s.time});
+  const legacyProgramme=String(s.programme||'')
+    .replace('13:00 · Guest arrival & welcome drinks','13:30 · Guest arrival & welcome drinks')
+    .replace(/Reception & dinner/gi,'Reception');
+  const published=await get('programme');
+  const programmeEvents=published??readLegacyProgramme(legacyProgramme);
+  const programme=published?published.map(({time,title})=>time+' · '+title).join('\n'):legacyProgramme;
+  return json({...s,programme,programmeEvents});
+}
 if(p==='/api/rsvp'&&req.method==='POST'){let d=await req.json();const email=String(d.email||'').trim();if(typeof d.name!=='string'||!d.name.trim()||d.name.length>100||(email.length>254||! /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))||(d.guests!==undefined&&+d.guests!==1)||!['yes','no'].includes(d.attending))return json({error:'Enter your full name and email address. Each RSVP is for one individual.'},400);let id=crypto.randomUUID();await put('rsvp/'+id,{id,name:d.name.trim(),email,emailConsent:d.emailConsent===true,consentText:d.emailConsent===true?'I agree to receive email RSVP approval or decline updates from Vimbai and Clarence.':null,consentedAt:d.emailConsent===true?new Date().toISOString():null,guests:1,guestNames:d.name.trim(),attending:d.attending,status:d.attending==='yes'?'pending':'declined',created:new Date().toISOString()});return json({id})}
 if(p==='/api/messaging-status'){if(!admin)return json({error:'Please sign in'},401);return json(env.EMAIL_STATUS||{enabled:false,missing:[],switchedOn:false})}
 if(p.startsWith('/api/export/')){if(!admin)return json({error:'Please sign in'},401);let rows,headers,filename;if(p==='/api/export/guests.csv'){const guests=(await Promise.all((await list('rsvp/')).map(o=>get(o.key)))).filter(Boolean);headers=['Guest names','Number attending','RSVP submitted by','email','Status'];rows=guests.filter(r=>r.status==='approved').sort(compareGuestNames).map(r=>[r.guestNames||r.name,r.guests,r.name,r.email||'',r.status]);filename='attending-guests.csv'}else if(p==='/api/export/gifts.csv'){const gifts=await Promise.all((await list('gifts/')).map(o=>get(o.key)));headers=['Giver name','Gift description','Submitted at'];rows=gifts.map(g=>[g.name,g.description,g.created]);filename='wedding-gifts.csv'}else return json({error:'Not found'},404);const cell=v=>{let t=String(v??'');if(/^[\s]*[=+@-]/.test(t)||/^[\t\r\n]/.test(t))t="'"+t;return '"'+t.replaceAll('"','""')+'"'};const csv='\uFEFF'+[headers,...rows].map(row=>row.map(cell).join(',')).join('\r\n')+'\r\n';return new Response(csv,{headers:{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':'attachment; filename="'+filename+'"','Cache-Control':'no-store'}})}
 if(p==='/api/guestbook'){if(req.method==='POST'){let d=await req.json();if(typeof d.firstName!=='string'||!d.firstName.trim()||d.firstName.length>100||typeof d.surname!=='string'||!d.surname.trim()||d.surname.length>100||typeof d.message!=='string'||!d.message.trim()||d.message.length>3000)return json({error:'Please enter your name, surname and message.'},400);const id=crypto.randomUUID();await put('guestbook/'+id,{id,firstName:d.firstName.trim(),surname:d.surname.trim(),message:d.message.trim(),created:new Date().toISOString()});return json({ok:true})}if(req.method==='GET'){if(!admin)return json({error:'Please sign in'},401);return json(await Promise.all((await list('guestbook/')).map(o=>get(o.key))))}return json({error:'Method not allowed'},405)}
 if(p==='/api/gifts'){if(req.method==='POST'){let d=await req.json();if(typeof d.name!=='string'||!d.name.trim()||d.name.length>100||typeof d.description!=='string'||!d.description.trim()||d.description.length>2000)return json({error:'Please enter your name and what you gave as a gift.'},400);const id=crypto.randomUUID();await put('gifts/'+id,{id,name:d.name.trim(),description:d.description.trim(),created:new Date().toISOString()});return json({ok:true})}if(req.method==='GET'){if(!admin)return json({error:'Please sign in'},401);return json(await Promise.all((await list('gifts/')).map(o=>get(o.key))))}return json({error:'Method not allowed'},405)}
-if(p==='/api/admin'){if(!admin)return json({error:'Incorrect password'},401);if(req.method==='POST'){let d=await req.json();if(typeof d.id!=='string'||!/^[-a-zA-Z0-9]+$/.test(d.id))return json({error:'Invalid response ID'},400);const run=async()=>{let r=await get('rsvp/'+d.id);if(!r)return json({error:'Response not found'},404);if(d.action==='delete'){if(r.emailNotification?.status==='sending')return json({error:'A message is being sent. Wait for it to finish before deleting this RSVP.'},409);r.deletedAt=new Date().toISOString();await put('rsvp/'+r.id,r);return json({ok:true})}const retry=d.action==='retry_email';if(retry){if(!['approved','declined'].includes(r.status)||!['failed','not_configured'].includes(r.emailNotification?.status))return json({error:'Check the previous result before attempting another message.'},409)}else if(!['approved','declined'].includes(d.status))return json({error:'Invalid RSVP decision'},400);const changed=!retry&&r.status!==d.status;if(!retry)r.status=d.status;await put('rsvp/'+r.id,r);if(changed||retry){const config={...defaults,...(await get('settings')||{})};r.emailNotification={status:'sending',decision:r.status,attemptedAt:new Date().toISOString(),attemptId:crypto.randomUUID()};await put('rsvp/'+r.id,r);const result=env.EMAIL_NOTIFY?await env.EMAIL_NOTIFY({...r,weddingDate:config.date,weddingTime:config.time||'13:30'}):{status:'not_configured',detail:'email is not connected. The RSVP decision is saved.'};r.emailNotification={...r.emailNotification,...result};await put('rsvp/'+r.id,r)}return json({ok:true,notification:r.emailNotification||null})};return env.WITH_RSVP_LOCK?env.WITH_RSVP_LOCK(d.id,run):run()}return json((await Promise.all((await list('rsvp/')).map(o=>get(o.key)))).filter(Boolean))}
+if(p==='/api/admin'){if(!admin)return json({error:'Incorrect password'},401);if(req.method==='POST'){let d=await req.json();
+if(d?.action==='publish_programme'){
+  const events=d.events;
+  if(!Array.isArray(events)||events.length>100||events.some(event=>
+    typeof event?.time!=='string'||!/^\d{2}:[0-5]\d$/.test(event.time)||
+    event.time<programmeHours.start||event.time>programmeHours.end||
+    typeof event.title!=='string'||!event.title.trim()||event.title.length>200
+  ))return json({error:'Enter an event name and a time from 10:00 to 20:00 for every row.'},400);
+  const sorted=events.map(({time,title})=>({time,title:title.trim()})).sort((a,b)=>a.time.localeCompare(b.time));
+  await put('programme',sorted);
+  return json({ok:true,events:sorted});
+}
+if(typeof d.id!=='string'||!/^[-a-zA-Z0-9]+$/.test(d.id))return json({error:'Invalid response ID'},400);const run=async()=>{let r=await get('rsvp/'+d.id);if(!r)return json({error:'Response not found'},404);if(d.action==='delete'){if(r.emailNotification?.status==='sending')return json({error:'A message is being sent. Wait for it to finish before deleting this RSVP.'},409);r.deletedAt=new Date().toISOString();await put('rsvp/'+r.id,r);return json({ok:true})}const retry=d.action==='retry_email';if(retry){if(!['approved','declined'].includes(r.status)||!['failed','not_configured'].includes(r.emailNotification?.status))return json({error:'Check the previous result before attempting another message.'},409)}else if(!['approved','declined'].includes(d.status))return json({error:'Invalid RSVP decision'},400);const changed=!retry&&r.status!==d.status;if(!retry)r.status=d.status;await put('rsvp/'+r.id,r);if(changed||retry){const config={...defaults,...(await get('settings')||{})};r.emailNotification={status:'sending',decision:r.status,attemptedAt:new Date().toISOString(),attemptId:crypto.randomUUID()};await put('rsvp/'+r.id,r);const result=env.EMAIL_NOTIFY?await env.EMAIL_NOTIFY({...r,weddingDate:config.date,weddingTime:config.time||'13:30'}):{status:'not_configured',detail:'email is not connected. The RSVP decision is saved.'};r.emailNotification={...r.emailNotification,...result};await put('rsvp/'+r.id,r)}return json({ok:true,notification:r.emailNotification||null})};return env.WITH_RSVP_LOCK?env.WITH_RSVP_LOCK(d.id,run):run()}return json((await Promise.all((await list('rsvp/')).map(o=>get(o.key)))).filter(Boolean))}
 const token=u.searchParams.get('token');const guest=token?await get('rsvp/'+token):null;const approved=guest?.status==='approved';
 if(p==='/api/status')return json(guest?{name:guest.name,status:guest.status}:{status:'unknown'});
 if(p==='/api/photos'){if(!approved&&!admin)return json({error:'Photo sharing opens after RSVP approval.'},403);if(req.method==='POST'){const f=await req.formData(),files=f.getAll('photos');if(files.length<4||files.length>12)return json({error:'Select 4–12 photos.'},400);for(const f of files){if(!['image/jpeg','image/png','image/webp'].includes(f.type)||f.size>8*1024*1024)return json({error:'Use JPG, PNG or WebP photos under 8 MB.'},400)}for(const f of files)await bucket.put('photos/'+crypto.randomUUID(),f.stream(),{httpMetadata:{contentType:f.type}});return json({ok:true})}return json((await list('photos/')).map(o=>o.key))}
@@ -51,9 +93,35 @@ body.home-page{height:100svh;min-height:0;display:flex;flex-direction:column;ove
 .home-page .hero .invitation-details h1{font-size:clamp(32px,5.3svh,56px);line-height:1.05;margin:0 0 12px}
 .home-page .hero .invitation-details h1 i{font-size:1.12em}
 @media(max-height:700px){.home-page .hero .invitation-details h1{font-size:30px;margin-bottom:6px}}
+
+.admin-heading{display:flex;justify-content:space-between;align-items:center;gap:12px;margin:0 0 18px}
+.admin-heading h1{margin:0}
+.admin-sign-out{white-space:nowrap;padding:8px 14px}
+.admin-nav{display:flex;flex-wrap:wrap;gap:4px;margin:0 0 24px;padding:5px;background:#eae8da;border:1px solid #dfdccd;border-radius:8px;letter-spacing:0}
+.admin-nav a{padding:10px 12px;border-radius:5px;font-weight:600}
+.admin-nav a:hover{background:#dfdfce}
+.admin-nav a[aria-current="page"]{background:var(--green);color:#fff}
+.admin-links,.programme-actions{display:flex;flex-wrap:wrap;gap:10px}
+.admin-links .button,.programme-actions button{margin:0;padding:9px 14px}
+.programme-editor{max-width:690px}
+.programme-row{display:grid;grid-template-columns: minmax(120px,145px) minmax(0,1fr) auto;align-items:end;gap:10px;margin-bottom:12px}
+.programme-row label{display:block;margin:0;font:600 13px/1.5 Arial,sans-serif}
+.programme-row input{display:block;width:100%;min-width:0;margin-top:4px}
+.programme-row button{margin:0;padding:9px 12px;background:transparent;color:var(--green)}
+.programme-row button:hover{background:#eae8da}
+.programme-timeline{padding-left:0;list-style:none}
+.programme-timeline .event{display:flex;align-items:baseline;gap:16px}
+.programme-timeline time{flex:0 0 3.2em;color:var(--green);font-weight:bold}
+.programme-timeline .event span{overflow-wrap:anywhere}
+@media(max-width:540px){
+  .admin-nav{gap:2px}.admin-nav a{padding:8px;font-size:12px}
+  .programme-row{grid-template-columns:minmax(0,1fr) auto}
+  .programme-row .programme-name{grid-column:1/-1;grid-row:2}
+  .programme-row button{grid-column:2;grid-row:1}
+}
 </style><header><a class="brand" href="#home">V <em>&</em> C</a><nav><a class="my-rsvp-main" href="#status">My RSVP ↗</a></nav></header><main id="app"></main><footer><div class="brand">V <em>&</em> C</div><p>With love, always.</p><p class="powered-by">Powered by <strong>NATLOP TECHNOLOGIES</strong></p></footer><div id="toast" class="toast hidden" role="status"></div><script>
 const images=${JSON.stringify(IMAGES)}, bannerImages=${JSON.stringify(BANNER_IMAGES)}, D=${JSON.stringify(defaults)};let settings=D,approvedGuestName='',dashboardSearch='',adminKey='',timer,slide=0;const app=document.getElementById('app');const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const token=()=>new URLSearchParams(location.search).get('guest')||localStorage.getItem('wedding-rsvp')||'';
-async function api(path,opts={}){let r=await fetch('/api/'+path,{...opts,headers:{...opts.headers,...(adminKey?{Authorization:'Bearer '+adminKey}:{})}});let d=await r.json();if(!r.ok)throw Error(d.error||'Please try again');return d}function toast(s){let t=document.getElementById('toast');t.textContent=s;t.classList.remove('hidden');setTimeout(()=>t.classList.add('hidden'),4500)}function page(title,body){const back=['programme','venue','gifts','photos','guestbook'].includes(location.hash.slice(1))&&title!=='A little more to look forward to'?'<a class="button lounge-back" href="#lounge">← Back to the lounge</a>':'';document.body.classList.remove('home-page');document.body.classList.add('inner-page');app.innerHTML='<section class="page">'+back+'<div class="eyebrow">THE WEDDING OF '+esc(settings.names)+'</div><h1>'+title+'</h1>'+body+'</section>'}
+async function api(path,opts={}){let r=await fetch('/api/'+path,{...opts,headers:{...opts.headers,...(adminKey?{Authorization:'Bearer '+adminKey}:{})}});let d=await r.json();if(!r.ok)throw Error(d.error||'Please try again');return d}function toast(s){let t=document.getElementById('toast');t.textContent=s;t.classList.remove('hidden');setTimeout(()=>t.classList.add('hidden'),4500)}function page(title,body,adminPage=false){const back=['programme','venue','gifts','photos','guestbook'].includes(location.hash.slice(1))&&title!=='A little more to look forward to'?'<a class="button lounge-back" href="#lounge">← Back to the lounge</a>':'';document.body.classList.remove('home-page');document.body.classList.add('inner-page');app.innerHTML='<section class="page">'+back+'<div class="eyebrow">THE WEDDING OF '+esc(settings.names)+'</div>'+(adminPage?'<div class="admin-heading"><h1>'+title+'</h1><button type="button" class="admin-sign-out" onclick="signOutAdmin()">Sign out</button></div>':'<h1>'+title+'</h1>')+body+'</section>'}
 function home(){document.body.classList.add('home-page');document.body.classList.remove('inner-page');app.innerHTML='<section class="hero"><div class="intro"><div class="invitation-heading"><div class="eyebrow">Together, for a brighter tomorrow</div><div class="ornament">❧</div></div><div class="invitation-details"><h1>You’re <i>Invited</i></h1><div class="date">'+esc(settings.names.toUpperCase())+'<br><br>'+new Date(settings.date+'T12:00:00').toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'}).toUpperCase()+'<br>STARTS AT '+esc(settings.time||'13:30')+'</div><p>We would be so happy for you to celebrate this special day with us.</p><a class="button" href="#rsvp">Kindly RSVP ↗</a></div></div><div class="portrait"><img id="banner-backdrop" class="banner-backdrop" src="'+bannerImages[0]+'" alt="" aria-hidden="true"><img id="banner" src="'+bannerImages[0]+'" alt="Vimbai and Clarence together in olive green"><div class="photo-caption">OUR FOREVER BEGINS HERE</div><div class="dots">'+bannerImages.map((_,i)=>'<button aria-label="View photo '+(i+1)+'" class="'+(!i?'active':'')+'" onclick="showSlide('+i+')"></button>').join('')+'</div></div></section><div class="countdown"><div class="count-label">Counting down to forever</div>'+['days','hours','minutes','seconds'].map(x=>'<div><span id="'+x+'">—</span><small>'+x.toUpperCase()+'</small></div>').join('')+'</div><div class="home-inspiration"><div class="palette"><div class="eyebrow">A LITTLE INSPIRATION</div><h3>The colours of our celebration</h3><div class="swatches"><i style="background:#455b3b"></i><i style="background:#e7be59"></i><i style="background:#e6dec9"></i><i style="background:#858872"></i></div><p class="muted">Olive green · Golden yellow · Warm cream · Sage</p></div></div>';tick();timer=setInterval(()=>{tick();showSlide((slide+1)%bannerImages.length)},5000)}
 function showSlide(n){slide=n;let b=document.getElementById('banner');if(b){b.src=bannerImages[n];document.getElementById('banner-backdrop').src=bannerImages[n];b.alt=['Vimbai and Clarence together in olive green','Clarence and Vimbai together','Clarence in the garden','Vimbai in the garden'][n];document.querySelectorAll('.dots button').forEach((x,i)=>x.classList.toggle('active',i===n))}}function tick(){let diff=Math.max(0,new Date(settings.date+'T'+(settings.time||'13:30')+':00+02:00')-Date.now());let vals=[Math.floor(diff/86400000),Math.floor(diff/3600000)%24,Math.floor(diff/60000)%60,Math.floor(diff/1000)%60];['days','hours','minutes','seconds'].forEach((x,i)=>{let e=document.getElementById(x);if(e)e.textContent=vals[i]})}
 async function approved(){approvedGuestName='';let s=await api('status?token='+encodeURIComponent(token()));if(s.status==='approved'){approvedGuestName=String(s.name||'').trim();settings=await api('settings?token='+encodeURIComponent(token()));return true;}page('A little more to look forward to','<div class="notice">Your guest lounge and wedding menu open after the couple has approved your RSVP.</div><a class="button" href="#rsvp">Send your RSVP</a> <a href="#status">Check my RSVP</a>');return false}
@@ -63,19 +131,154 @@ if(route==='guestbook'){page('Guest Book','<p class="muted">Leave Vimbai and Cla
 if(route==='rsvp'){page('We’ve saved you a place','<p class="muted">Please let us know if you can join us. Your response will be reviewed by the bride and groom.</p><form id="rsvp" class="form"><label for="name">Full name *</label><input id="name" name="name" required maxlength="100"><label for="email">Email address *</label><input id="email" name="email" type="email" autocomplete="email" required maxlength="254" placeholder="e.g. yourname@example.com"><label for="attending">Will you be attending? *</label><select id="attending" name="attending"><option value="yes">Joyfully accepts</option><option value="no">Regretfully declines</option></select><p class="field-help">This RSVP is for you only. Each guest must submit their own RSVP.</p><p class="muted">Your name and contact details will be shared only with the couple for wedding planning.</p><label class="consent-row" for="email-consent"><input id="email-consent" name="emailConsent" type="checkbox"><span>I agree to receive email RSVP approval or decline updates from Vimbai and Clarence.</span></label><div class="notice"><strong>Check your email after your RSVP is reviewed.</strong><br>If you opt in to email updates, we’ll send your RSVP confirmation to the address you provided. Please check your <strong>Inbox</strong> and <strong>Spam or Junk</strong> folder.</div><p class="field-help">If you do not opt in, you can check your RSVP confirmation using your personal RSVP link.</p><button>Submit RSVP ↗</button></form>');document.getElementById('rsvp').onsubmit=async e=>{e.preventDefault();let b=e.target.querySelector('button');b.disabled=true;try{const payload=Object.fromEntries(new FormData(e.target));payload.emailConsent=document.getElementById('email-consent').checked;let d=await api('rsvp',{method:'POST',body:JSON.stringify(payload)});localStorage.setItem('wedding-rsvp',d.id);location.hash='status'}catch(e){toast(e.message)}finally{b.disabled=false}};return}
 if(route==='gifts'){page('A gift from the heart','<div class="center" style="max-width:600px;margin:35px auto"><div class="ornament">♡</div><p class="muted">Your presence is the greatest gift. If you would like to bless us with a contribution as we begin this new chapter, you can send your gift using EcoCash.</p><div class="notice"><div class="eyebrow">ECOCASH</div><p style="font-size:32px;letter-spacing:2px;margin:15px 0"><a href="tel:0783789153" style="text-decoration:none">0783789153</a></p><p class="muted" style="margin-bottom:0">Thank you for your love and generosity.</p></div></div><form id="gift-form" class="form"><h2 style="font-size:30px;font-weight:400">Let us know about your gift</h2><p class="muted">If you have already given a gift, you can leave its details here. Only the couple can see your message.</p><label for="giver-name">Your name *</label><input id="giver-name" name="name" required maxlength="100" autocomplete="name"><label for="gift-description">What did you give? *</label><textarea id="gift-description" name="description" required maxlength="2000" placeholder="For example: a dinner set, or an EcoCash contribution. Please do not include PINs or passwords."></textarea><button>Send gift details ↗</button><p id="gift-result" role="status"></p></form>');document.getElementById('gift-form').onsubmit=async e=>{e.preventDefault();let b=e.target.querySelector('button');b.disabled=true;try{await api('gifts',{method:'POST',body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});e.target.reset();document.getElementById('gift-result').textContent='Thank you! Your gift details have been sent to Vimbai and Clarence.'}catch(err){toast(err.message)}finally{b.disabled=false}};return}
 if(route==='status'){let s=await api('status?token='+encodeURIComponent(token()));page(s.status==='approved'?'You’re on the guest list!':s.status==='pending'?'Thank you for your RSVP':s.status==='declined'?'Thank you for letting us know':'Your RSVP','<div class="notice">'+({approved:'We can’t wait to celebrate with you. Your wedding details are now open.',pending:'Your response has been received. The bride and groom will review it shortly. Save this private link to check your approval status.',declined:'We’ll miss you and appreciate your warm wishes.',unknown:'Send an RSVP first, or use the personal link saved when you responded.'}[s.status])+'</div>'+(s.status==='pending'?'<div class="notice"><strong>Look out for your RSVP email.</strong><br>If you opted in to email updates, we’ll email you after the couple reviews your RSVP. Please check your <strong>Inbox</strong> and <strong>Spam or Junk</strong> folder.</div>':'')+(token()?'<p><a href="?guest='+encodeURIComponent(token())+'#status">Your personal RSVP link — save this</a></p>':'')+(s.status==='approved'?'<a class="button" href="#lounge">Enter the guest lounge ↗</a>':s.status==='unknown'?'<a class="button" href="#rsvp">Register your RSVP ↗</a>':'<button onclick="render()">Refresh status</button>'));return}
-if(route==='venue'||route==='programme'||route==='photos'){if(!await approved())return;if(route==='venue'){page('A beautiful place to say “I do”','<div class="notice"><h2>'+esc(settings.venue)+'</h2><p>'+esc(settings.address||'The couple will add the full address soon.')+'</p><p>Wedding starts at <strong>'+esc(settings.time||'13:30')+'</strong> (Harare time)</p>'+(settings.address?'<a class="button" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination='+encodeURIComponent(settings.address)+'">Open Google Maps directions ↗</a>':'')+'</div>');return}if(route==='programme'){page('The programme','<p class="muted">A little guide to our celebration. Draft timings, subject to confirmation.</p><div class="timeline">'+settings.programme.split('\n').map(x=>'<div class="event">'+esc(x)+'</div>').join('')+'</div>');return}page('Through your eyes','<p class="muted">The candid moments. The happy tears. The dance floor. Share 4–12 photos at a time to help us remember it all.</p><form id="upload" class="form"><label for="files">Select at least 4 photos</label><input id="files" name="photos" type="file" accept="image/jpeg,image/png,image/webp" multiple required><p class="muted">JPG, PNG or WebP · up to 8 MB each. Photos are visible to approved guests.</p><button>Upload memories ↗</button></form><div id="gallery" class="photo-grid"></div>');let photos=await api('photos?token='+token());document.getElementById('gallery').innerHTML=photos.map(p=>'<img loading="lazy" alt="A shared wedding memory" src="/api/photo/'+p.split('/')[1]+'?token='+token()+'">').join('');document.getElementById('upload').onsubmit=async e=>{e.preventDefault();let btn=e.target.querySelector('button');btn.disabled=true;btn.textContent='Uploading…';try{await api('photos?token='+token(),{method:'POST',body:new FormData(e.target)});toast('Your memories have been saved. Thank you!');render()}catch(e){toast(e.message);btn.disabled=false;btn.textContent='Upload memories ↗'}};return}
-if(route==='admin'){if(!adminKey){page('A space for the two of you','<p class="muted">Manage your guest list and the details of your day.</p><form id="login" class="form"><label for="password">Couple’s password</label><input id="password" type="password" required autocomplete="current-password"><button>Open dashboard ↗</button></form>');document.getElementById('login').onsubmit=async e=>{e.preventDefault();adminKey=document.getElementById('password').value;try{await api('admin');render()}catch(e){adminKey='';toast(e.message)}};return}await dashboard();return}home()}catch(e){page('One moment, please','<div class="notice">'+esc(e.message)+'</div><button onclick="render()">Try again</button>')}}
+if(route==='venue'||route==='programme'||route==='photos'){if(!await approved())return;if(route==='venue'){page('A beautiful place to say “I do”','<div class="notice"><h2>'+esc(settings.venue)+'</h2><p>'+esc(settings.address||'The couple will add the full address soon.')+'</p><p>Wedding starts at <strong>'+esc(settings.time||'13:30')+'</strong> (Harare time)</p>'+(settings.address?'<a class="button" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination='+encodeURIComponent(settings.address)+'">Open Google Maps directions ↗</a>':'')+'</div>');return}if(route==='programme'){page('The programme',guestProgramme(settings.programmeEvents));return}page('Through your eyes','<p class="muted">The candid moments. The happy tears. The dance floor. Share 4–12 photos at a time to help us remember it all.</p><form id="upload" class="form"><label for="files">Select at least 4 photos</label><input id="files" name="photos" type="file" accept="image/jpeg,image/png,image/webp" multiple required><p class="muted">JPG, PNG or WebP · up to 8 MB each. Photos are visible to approved guests.</p><button>Upload memories ↗</button></form><div id="gallery" class="photo-grid"></div>');let photos=await api('photos?token='+token());document.getElementById('gallery').innerHTML=photos.map(p=>'<img loading="lazy" alt="A shared wedding memory" src="/api/photo/'+p.split('/')[1]+'?token='+token()+'">').join('');document.getElementById('upload').onsubmit=async e=>{e.preventDefault();let btn=e.target.querySelector('button');btn.disabled=true;btn.textContent='Uploading…';try{await api('photos?token='+token(),{method:'POST',body:new FormData(e.target)});toast('Your memories have been saved. Thank you!');render()}catch(e){toast(e.message);btn.disabled=false;btn.textContent='Upload memories ↗'}};return}
+if(route==='admin'||route.startsWith('admin/')){if(!adminKey){page('A space for the two of you','<p class="muted">Manage your guest list and the details of your day.</p><form id="login" class="form"><label for="password">Couple’s password</label><input id="password" type="password" required autocomplete="current-password"><button>Open dashboard ↗</button></form>');document.getElementById('login').onsubmit=async e=>{e.preventDefault();adminKey=document.getElementById('password').value;try{await api('admin');render()}catch(e){adminKey='';toast(e.message)}};return}await dashboard();return}home()}catch(e){page('One moment, please','<div class="notice">'+esc(e.message)+'</div><button onclick="render()">Try again</button>')}}
 const compareGuestNames=${compareGuestNames.toString()};
 function rsvpTable(responses,emptyMessage){
   return '<div class="table-wrap"><table><thead><tr><th>Guest</th><th>Party</th><th>Guest names</th><th>Status / email</th><th>Manage RSVP</th></tr></thead><tbody>'+responses.map(r=>'<tr data-admin-search><td>'+esc(r.name)+'<br>'+esc(r.email||'Email not supplied — contact guest to collect it')+'</td><td>'+esc(r.guests)+'</td><td>'+esc(r.guestNames||r.name)+'</td><td><span class="tag">'+esc(r.status)+'</span><div class="notification-status">'+esc(notificationLabel(r.emailNotification))+'</div>'+(['failed','not_configured'].includes(r.emailNotification?.status)?'<button onclick="retryEmail(\''+r.id+'\')">Retry email</button>':'')+'</td><td><button onclick="changeStatus(\''+r.id+'\',\'approved\')">Approve</button><button onclick="changeStatus(\''+r.id+'\',\'declined\')">Decline</button><button class="delete-rsvp" onclick="deleteRsvp(\''+r.id+'\')">Delete</button><a href="?guest='+r.id+'#status" target="_blank">Guest link ↗</a></td></tr>').join('')+(responses.length?'':'<tr><td colspan="5">'+emptyMessage+'</td></tr>')+'</tbody></table></div>';
 }
-async function dashboard(){settings=await api('settings');let rows=await api('admin'),gifts=await api('gifts'),messages=await api('guestbook'),messaging=await api('messaging-status');
-const pending=rows.filter(r=>r.status==='pending');
-const reviewed=rows.filter(r=>r.status!=='pending').sort(compareGuestNames);
-const attending=reviewed.filter(r=>r.status==='approved');
-page('Your wedding, at a glance','<button onclick="adminKey=\'\';render()" style="float:right">Sign out</button><div class="admin-search"><label for="admin-search">Search dashboard</label><input id="admin-search" type="search" placeholder="Search names, email, status, gifts or messages" value="'+esc(dashboardSearch)+'"><p id="search-result" role="status"></p></div><p class="muted">'+pending.length+' awaiting approval · '+attending.reduce((a,r)=>a+Number(r.guests),0)+' approved guests</p><div class="notice">'+(messaging.enabled?'email sending is enabled. Each new approval or decline attempts one personalised email to guests who opted in.':'email sending is not enabled. RSVP decisions will still save; connect your email provider in Render before sending.')+'</div><h2>Pending RSVPs</h2>'+rsvpTable(pending,'No RSVPs are awaiting approval.')+'<h2>Attending guest list</h2><button class="export-btn" onclick="downloadCsv(\'guests\')">Download guest list CSV ↓</button><p class="muted">Approved guests who confirmed attendance. Guest names and party totals are shown below.</p><div class="table-wrap"><table><thead><tr><th>Guest names</th><th>Number attending</th><th>RSVP submitted by</th></tr></thead><tbody>'+attending.map(r=>'<tr data-admin-search><td style="white-space:pre-wrap">'+esc(r.guestNames||r.name)+'</td><td>'+esc(r.guests)+'</td><td>'+esc(r.name)+'</td></tr>').join('')+(attending.length?'':'<tr><td colspan="3">No approved guests yet. Approve confirmed RSVPs above to add them to this list.</td></tr>')+'</tbody></table></div><h2>Reviewed RSVPs</h2>'+rsvpTable(reviewed,'No reviewed RSVPs yet.')+'<p class="muted">Approval messages include the guest’s personal link. Check each email status below; a email provider submission is not proof of delivery. Earlier RSVPs without email addresses need to be contacted separately to collect them.</p><h2>Gift messages</h2><button class="export-btn" onclick="downloadCsv(\'gifts\')">Download gift list CSV ↓</button><p class="muted">Messages submitted by givers; these are not payment confirmations.</p><div class="table-wrap"><table><thead><tr><th>From</th><th>Gift details</th><th>Submitted</th></tr></thead><tbody>'+gifts.map(g=>'<tr data-admin-search><td>'+esc(g.name)+'</td><td style="white-space:pre-wrap">'+esc(g.description)+'</td><td>'+esc(new Date(g.created).toLocaleDateString('en-GB'))+'</td></tr>').join('')+(gifts.length?'':'<tr><td colspan="3">No gift messages yet.</td></tr>')+'</tbody></table></div><h2>Private guestbook</h2><div class="guestbook-messages">'+messages.map(m=>'<article class="notice" data-admin-search><h3>'+esc(m.firstName)+' '+esc(m.surname)+'</h3><small>'+esc(new Date(m.created).toLocaleDateString('en-GB'))+'</small><p style="white-space:pre-wrap">'+esc(m.message)+'</p></article>').join('')+(messages.length?'':'<p class="muted">No guestbook messages yet.</p>')+'</div><h2>Wedding details</h2><form id="settings" class="form">'+[['names','Couple’s names'],['date','Wedding date'],['time','Wedding start time'],['venue','Venue name'],['address','Full venue address']].map(([k,l])=>'<label for="s-'+k+'">'+l+'</label><input id="s-'+k+'" name="'+k+'" '+(k==='date'?'type="date"':k==='time'?'type="time"':'')+' required value="'+esc(settings[k])+'">').join('')+'<label for="s-programme">Programme (one event per line)</label><textarea id="s-programme" name="programme" style="min-height:200px">'+esc(settings.programme)+'</textarea><button>Save wedding details</button></form>');document.getElementById('admin-search').addEventListener('input',e=>{dashboardSearch=e.target.value;filterDashboard()});filterDashboard();document.getElementById('settings').onsubmit=async e=>{e.preventDefault();try{let d=Object.fromEntries(new FormData(e.target));await api('settings',{method:'POST',body:JSON.stringify(d)});settings=d;toast('Wedding details saved')}catch(e){toast(e.message)}}}
+const adminTabs=[
+  ['admin','Overview'],
+  ['admin/pending','Pending RSVPs'],
+  ['admin/attending','Attending guest list'],
+  ['admin/reviewed','Reviewed RSVPs'],
+  ['admin/programme','Wedding programme'],
+  ['admin/gifts','Gifts']
+];
+const adminTitles={...Object.fromEntries(adminTabs),'admin':'Admin dashboard','admin/guestbook':'Private guestbook','admin/settings':'Wedding details'};
+const programmeHours=${JSON.stringify(programmeHours)};
+const adminRoute=()=>location.hash.slice(1);
+function signOutAdmin(){
+  adminKey='';
+  dashboardSearch='';
+  if(adminRoute()==='admin')render();
+  else location.hash='admin';
+}
+function adminNav(route){
+  return '<nav class="admin-nav" aria-label="Admin dashboard">'+adminTabs.map(([href,label])=>
+    '<a href="#'+href+'"'+(route===href?' aria-current="page"':'')+'>'+label+'</a>'
+  ).join('')+'</nav>';
+}
+function searchDashboard(){
+  return '<div class="admin-search"><label for="admin-search">Search this page</label><input id="admin-search" type="search" placeholder="Search this list" value="'+esc(dashboardSearch)+'"><p id="search-result" role="status"></p></div>';
+}
+function guestProgramme(events){
+  if(!events.length)return '<p class="muted">The wedding programme will be shared here.</p>';
+  return '<p class="muted">All times are in Harare time.</p><ol class="timeline programme-timeline">'+events.map(({time,title})=>
+    '<li class="event">'+(time?'<time datetime="'+esc(time)+'">'+esc(time)+'</time>':'')+'<span>'+esc(title)+'</span></li>'
+  ).join('')+'</ol>';
+}
+function programmeRow({time='',title=''}={}){
+  return '<div class="programme-row"><label>Time <input type="time" name="eventTime" min="'+programmeHours.start+'" max="'+programmeHours.end+'" value="'+esc(time)+'" required></label><label class="programme-name">Event <input name="eventTitle" maxlength="200" value="'+esc(title)+'" required></label><button type="button" data-remove-event aria-label="Remove event">Remove</button></div>';
+}
+function editProgramme(events){
+  return '<p>Add events between <strong>10:00 and 20:00</strong> (Harare time). Publishing updates the programme in the approved guest lounge.</p><form id="programme-editor" class="form programme-editor"><div id="programme-rows">'+events.map(event=>programmeRow(event)).join('')+'</div><div class="programme-actions"><button type="button" id="add-event">Add event</button><button type="submit">Publish programme</button></div><p id="programme-result" role="status"></p></form>';
+}
+function bindProgrammeEditor(){
+  const form=document.getElementById('programme-editor');
+  const rows=document.getElementById('programme-rows');
+  const result=document.getElementById('programme-result');
+  document.getElementById('add-event').onclick=()=>{
+    rows.insertAdjacentHTML('beforeend',programmeRow());
+    rows.lastElementChild.querySelector('input').focus();
+    result.textContent='';
+  };
+  rows.onclick=e=>{
+    const button=e.target.closest('[data-remove-event]');
+    if(!button)return;
+    button.closest('.programme-row').remove();
+    document.getElementById('add-event').focus();
+    result.textContent='';
+  };
+  form.oninput=()=>{result.textContent='';};
+  form.onsubmit=async e=>{
+    e.preventDefault();
+    const data=new FormData(form);
+    const times=data.getAll('eventTime');
+    const events=data.getAll('eventTitle').map((title,i)=>({title,time:times[i]}));
+    const controls=[...form.querySelectorAll('input,button')];
+    controls.forEach(control=>{control.disabled=true;});
+    result.textContent='Publishing…';
+    try{
+      const published=await api('admin',{method:'POST',body:JSON.stringify({action:'publish_programme',events})});
+      rows.innerHTML=published.events.map(event=>programmeRow(event)).join('');
+      result.textContent='Programme published to the guest lounge.';
+    }catch(e){result.textContent=e.message;}
+    finally{controls.forEach(control=>{control.disabled=false;});}
+  };
+}
+let previousAdminRoute;
+async function dashboard(){
+  const route=adminRoute(), key=adminKey;
+  if(!key)return;
+  if(previousAdminRoute!==route)dashboardSearch='';
+  previousAdminRoute=route;
+  let body, settingsData;
+  switch(route){
+    case 'admin/pending':
+    case 'admin/reviewed': {
+      const [rows,messaging]=await Promise.all([api('admin'),api('messaging-status')]);
+      const pending=route==='admin/pending';
+      const responses=rows.filter(r=>pending?r.status==='pending':r.status!=='pending');
+      if(!pending)responses.sort(compareGuestNames);
+      body=searchDashboard()+'<p class="muted">'+(messaging.enabled?'Guests who opted in receive an email when their RSVP is approved or declined.':'Email sending is disabled. RSVP changes still save.')+'</p>'+
+        rsvpTable(responses,pending?'No RSVPs are awaiting approval.':'No reviewed RSVPs yet.');
+      break;
+    }
+    case 'admin/attending': {
+      const attending=(await api('admin')).filter(r=>r.status==='approved').sort(compareGuestNames);
+      body=searchDashboard()+'<button class="export-btn" onclick="downloadCsv(\'guests\')">Download guest list CSV ↓</button><p class="muted">Approved guests who confirmed attendance. Guest names and party totals are shown below.</p><div class="table-wrap"><table><thead><tr><th>Guest names</th><th>Number attending</th><th>RSVP submitted by</th></tr></thead><tbody>'+attending.map(r=>'<tr data-admin-search><td style="white-space:pre-wrap">'+esc(r.guestNames||r.name)+'</td><td>'+esc(r.guests)+'</td><td>'+esc(r.name)+'</td></tr>').join('')+(attending.length?'':'<tr><td colspan="3">No approved guests yet. Approve RSVPs from the Pending RSVPs tab to add guests here.</td></tr>')+'</tbody></table></div>';
+      break;
+    }
+    case 'admin/gifts': {
+      const gifts=await api('gifts');
+      body=searchDashboard()+'<button class="export-btn" onclick="downloadCsv(\'gifts\')">Download gift list CSV ↓</button><p class="muted">Messages submitted by givers; these are not payment confirmations.</p><div class="table-wrap"><table><thead><tr><th>From</th><th>Gift details</th><th>Submitted</th></tr></thead><tbody>'+gifts.map(g=>'<tr data-admin-search><td>'+esc(g.name)+'</td><td style="white-space:pre-wrap">'+esc(g.description)+'</td><td>'+esc(new Date(g.created).toLocaleDateString('en-GB'))+'</td></tr>').join('')+(gifts.length?'':'<tr><td colspan="3">No gift messages yet.</td></tr>')+'</tbody></table></div>';
+      break;
+    }
+    case 'admin/guestbook': {
+      const messages=await api('guestbook');
+      body=searchDashboard()+'<div class="guestbook-messages">'+messages.map(m=>'<article class="notice" data-admin-search><h3>'+esc(m.firstName)+' '+esc(m.surname)+'</h3><small>'+esc(new Date(m.created).toLocaleDateString('en-GB'))+'</small><p style="white-space:pre-wrap">'+esc(m.message)+'</p></article>').join('')+(messages.length?'':'<p class="muted">No guestbook messages yet.</p>')+'</div>';
+      break;
+    }
+    case 'admin/programme':
+      settingsData=await api('settings');
+      body=editProgramme(settingsData.programmeEvents);
+      break;
+    case 'admin/settings':
+      settingsData=await api('settings');
+      body='<form id="settings" class="form">'+[['names','Couple’s names'],['date','Wedding date'],['time','Wedding start time'],['venue','Venue name'],['address','Full venue address']].map(([k,l])=>'<label for="s-'+k+'">'+l+'</label><input id="s-'+k+'" name="'+k+'" '+(k==='date'?'type="date"':k==='time'?'type="time"':'')+' required value="'+esc(settingsData[k])+'">').join('')+'<button>Save wedding details</button></form>';
+      break;
+    default: {
+      const rows=await api('admin');
+      const pendingCount=rows.filter(r=>r.status==='pending').length;
+      const guestCount=rows.filter(r=>r.status==='approved').reduce((sum,r)=>sum+Number(r.guests),0);
+      body='<p><a href="#admin/pending">'+pendingCount+' awaiting approval</a> · <a href="#admin/attending">'+guestCount+' approved guests</a></p><div class="admin-links"><a class="button" href="#admin/guestbook">Private guestbook</a><a class="button" href="#admin/settings">Wedding details</a></div>';
+      break;
+    }
+  }
+  if(route!==adminRoute()||key!==adminKey)return;
+  if(settingsData)settings=settingsData;
+  page(adminTitles[route]||'Admin dashboard',adminNav(route)+body,true);
+  const search=document.getElementById('admin-search');
+  if(search){
+    search.addEventListener('input',e=>{dashboardSearch=e.target.value;filterDashboard();});
+    filterDashboard();
+  }
+  if(route==='admin/programme')bindProgrammeEditor();
+  if(route==='admin/settings'){
+    document.getElementById('settings').onsubmit=async e=>{
+      e.preventDefault();
+      const changes=Object.fromEntries(new FormData(e.target));
+      try{
+        await api('settings',{method:'POST',body:JSON.stringify(changes)});
+        settings={...settings,...changes};
+        toast('Wedding details saved');
+      }catch(e){toast(e.message);}
+    };
+  }
+}
 function notificationLabel(n){if(!n)return 'No email message attempted';return ({submitted:'Submitted to email provider — delivery not confirmed',sending:'Sending — check before retrying',not_configured:'email provider not connected',no_email:'No email address',no_consent:'No email opt-in',failed:'Send failed'+(n.code?' (code '+n.code+')':''),unknown:'Result uncertain — check email provider logs'})[n.status]||n.status}
-function filterDashboard(){const query=dashboardSearch.trim().toLocaleLowerCase();const items=[...document.querySelectorAll('[data-admin-search]')];let visible=0;items.forEach(item=>{const match=!query||item.textContent.toLocaleLowerCase().includes(query);item.hidden=!match;if(match)visible++});const result=document.getElementById('search-result');if(result)result.textContent=query?visible+' matching records. CSV downloads include the full list.':''}
+function filterDashboard(){const query=dashboardSearch.trim().toLocaleLowerCase();const items=[...document.querySelectorAll('[data-admin-search]')];let visible=0;items.forEach(item=>{const match=!query||item.textContent.toLocaleLowerCase().includes(query);item.hidden=!match;if(match)visible++});const result=document.getElementById('search-result');if(result)result.textContent=query?visible+' matching records.':''}
 async function deleteRsvp(id){if(!confirm('Delete this RSVP response? It will be removed from the guest list and its personal lounge link will stop working. No email message will be sent.'))return;try{await api('admin',{method:'POST',body:JSON.stringify({id,action:'delete'})});await dashboard();toast('RSVP response deleted')}catch(e){toast(e.message)}}
 async function retryEmail(id){try{await api('admin',{method:'POST',body:JSON.stringify({id,action:'retry_email'})});await dashboard();toast('Check the updated email status.')}catch(e){toast(e.message)}}
 async function downloadCsv(kind){try{const r=await fetch('/api/export/'+kind+'.csv',{headers:{Authorization:'Bearer '+adminKey}});if(!r.ok)throw Error('Please sign in again to download the list.');const url=URL.createObjectURL(await r.blob()),a=document.createElement('a');a.href=url;a.download=kind==='guests'?'attending-guests.csv':'wedding-gifts.csv';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000)}catch(e){toast(e.message)}}
