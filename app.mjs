@@ -227,7 +227,8 @@ async function dashboard(){
     }
     case 'admin/attending': {
       const attending=(await api('admin')).filter(r=>r.status==='approved').sort(compareGuestNames);
-      body=searchDashboard()+'<button class="export-btn" onclick="downloadCsv(\'guests\')">Download guest list CSV ↓</button><p class="muted">Approved guests who confirmed attendance. Guest names and party totals are shown below.</p><div class="table-wrap"><table><thead><tr><th>Guest names</th><th>Number attending</th><th>RSVP submitted by</th></tr></thead><tbody>'+attending.map(r=>'<tr data-admin-search><td style="white-space:pre-wrap">'+esc(r.guestNames||r.name)+'</td><td>'+esc(r.guests)+'</td><td>'+esc(r.name)+'</td></tr>').join('')+(attending.length?'':'<tr><td colspan="3">No approved guests yet. Approve RSVPs from the Pending RSVPs tab to add guests here.</td></tr>')+'</tbody></table></div>';
+      const totalGuests=attending.reduce((sum,r)=>sum+Number(r.guests),0);
+      body=searchDashboard()+'<button class="export-btn" onclick="downloadCsv(\'guests\')">Download guest list CSV ↓</button><p><strong>Total guests attending</strong> · '+totalGuests+'</p><div class="table-wrap"><table><thead><tr><th scope="col">No.</th><th>Guest names</th><th>Number attending</th><th>RSVP submitted by</th></tr></thead><tbody>'+attending.map((r,index)=>'<tr data-admin-search><td aria-label="Row '+(index+1)+'">'+(index+1)+'</td><td style="white-space:pre-wrap">'+esc(r.guestNames||r.name)+'</td><td>'+esc(r.guests)+'</td><td>'+esc(r.name)+'</td></tr>').join('')+(attending.length?'':'<tr><td colspan="4">No approved guests yet. Approve RSVPs from the Pending RSVPs tab to add guests here.</td></tr>')+'</tbody></table></div>';
       break;
     }
     case 'admin/gifts': {
